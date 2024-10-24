@@ -1,0 +1,145 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sktime.forecasting.model_selection import temporal_train_test_split
+from sktime.performance_metrics.forecasting import mean_absolute_percentage_error
+from sktime.forecasting.base import ForecastingHorizon
+from sktime.registry import all_estimators
+from sktime.utils.validation.forecasting import check_y
+
+st.title('Time Series Analysis and Forecasting App')
+
+# Generate sample data with weekly frequency
+def generate_sample_data():
+    date_range = pd.date_range(start='2020-01-01', periods=200, freq='W')
+    np.random.seed(42)
+    data = pd.Series(50 + np.random.randn(200).cumsum(), index=date_range)
+    data = data.rename('Value')
+    return data
+
+# Option to use sample data or upload your own
+use_sample_data = st.checkbox('Use sample data', value=True)
+
+if use_sample_data:
+    data = generate_sample_data().to_frame()
+    st.success('Using sample data')
+else:
+    # File uploader
+    uploaded_file = st.file_uploader("Upload your time series CSV file", type=['csv'])
+    if uploaded_file is not None:
+        # Read the data
+        data = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
+        # Resample to weekly frequency if necessary
+        data = data.resample('W').mean()
+    else:
+        st.warning('Please upload a CSV file or select "Use sample data"')
+        st.stop()
+
+st.subheader('Raw Data')
+st.write(data.head())
+
+# Plot the time series
+st.subheader('Time Series Plot')
+st.line_chart(data)
+
+# Basic analysis
+st.subheader('Basic Statistics')
+st.write(data.describe())
+
+# Convert to pandas Series
+y = data.iloc[:, 0]  # Assuming the time series is in the first column
+
+# Check if y is univariate
+try:
+    y = check_y(y)
+except ValueError as e:
+    st.error(f"Error: {e}")
+    st.stop()
+
+# Allow user to select forecast horizon
+st.subheader('Select Forecast Horizon')
+forecast_options = {'3 Months (~13 weeks)': 13, '6 Months (~26 weeks)': 26}
+selected_forecast = st.selectbox('Choose forecast horizon', list(forecast_options.keys()))
+forecast_horizon_steps = forecast_options[selected_forecast]
+
+# Train-test split
+if len(y) <= forecast_horizon_steps:
+    st.error("The time series is too short for the selected forecast horizon.")
+    st.stop()
+y_train, y_test = temporal_train_test_split(y, test_size=forecast_horizon_steps)
+fh = ForecastingHorizon(y_test.index, is_relative=False)
+
+# Get list of univariate forecasters
+forecaster_tuples = all_estimators(estimator_types="forecaster")
+univariate_forecasters = []
+for name, ForecasterClass in forecaster_tuples:
+    scitype = ForecasterClass.get_class_tag("scitype:y")
+    requires_X = ForecasterClass.get_class_tag("requires-X")
+    if scitype in ("univariate", "both") and not requires_X:
+        univariate_forecasters.append(name)
+
+# Sort the list for better usability
+univariate_forecasters.sort()
+
+# Allow user to select multiple estimators
+st.subheader('Select Forecasters to Compare')
+selected_forecaster_names = st.multiselect('Choose one or more estimators', univariate_forecasters, default=['NaiveForecaster'])
+
+if not selected_forecaster_names:
+    st.warning('Please select at least one estimator.')
+    st.stop()
+
+# Initialize results dictionary
+results = {}
+progress_bar = st.progress(0)
+progress_step = 100 / len(selected_forecaster_names)
+current_progress = 0
+
+# Forecasting and evaluation
+for idx, name in enumerate(selected_forecaster_names):
+    st.write(f"### {name}")
+    try:
+        # Get the selected estimator class
+        selected_forecaster_class = dict(forecaster_tuples)[name]
+        # Initialize the estimator with default parameters
+        estimator = selected_forecaster_class()
+        # Fit the estimator
+        with st.spinner(f'Training {name}...'):
+            if estimator.get_tag('requires-fh-in-fit'):
+                estimator.fit(y_train, fh=fh)
+            else:
+                estimator.fit(y_train)
+        # Predict
+        y_pred = estimator.predict(fh)
+        # Evaluate
+        mape = mean_absolute_percentage_error(y_test, y_pred)
+        # Store results
+        results[name] = {'y_pred': y_pred, 'MAPE': mape}
+        # Plot forecasts
+        fig, ax = plt.subplots()
+        y_train.plot(ax=ax, label='Training Data')
+        y_test.plot(ax=ax, label='Test Data')
+        y_pred.plot(ax=ax, label=f'{name} Prediction')
+        ax.legend()
+        st.pyplot(fig)
+        # Update progress bar
+        current_progress += progress_step
+        progress_bar.progress(min(int(current_progress), 100))
+    except Exception as e:
+        st.error(f"Error with {name}: {e}")
+        continue
+
+# Performance comparison
+st.subheader('Model Performance Comparison')
+performance = pd.DataFrame({k: v['MAPE'] for k, v in results.items()}, index=['MAPE']).T
+performance.sort_values('MAPE', inplace=True)
+st.write(performance)
+
+# Highlight the best model
+if not performance.empty:
+    best_model = performance.index[0]
+    st.success(f"The best model based on MAPE is **{best_model}** with a MAPE of **{performance.iloc[0]['MAPE']:.4f}**.")
+
+# Hide progress bar when done
+progress_bar.empty()
